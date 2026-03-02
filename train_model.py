@@ -1,149 +1,172 @@
 """
-train_model.py
+train_model.py — QuantumReady ML Risk Predictor v2.0
 
-Train a Random Forest Classifier to predict Quantum Vulnerability Risk Levels.
+What's improved:
+  ✅ Expanded to 8 features: [RSA, ECC, MD5, SHA1, DiffieHellman, WeakTLS, AES, PQC]
+     (original had only 5 — MD5, DiffieHellman, WeakTLS were missing!)
+  ✅ 60-sample dataset (was 32) — better generalization
+  ✅ Cross-validation (5-fold) for reliable accuracy estimate
+  ✅ Saves feature names WITH model — prevents mismatch errors
+  ✅ Feature importance bar chart printed to console
 
-Feature vector: [rsa, ecc, sha1, aes, pqc]
-Classes:
-    - 0: Low Risk
-    - 1: Medium Risk
-    - 2: High Risk
-
-Usage: python train_model.py
+Usage:
+    python train_model.py
 """
-
-import os
-
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import classification_report, confusion_matrix
 import joblib
+import os
+
+FEATURE_NAMES = ['RSA', 'ECC', 'MD5', 'SHA1', 'DiffieHellman', 'WeakTLS', 'AES', 'PQC']
 
 
 def create_synthetic_dataset():
-    """Create a synthetic dataset for training.
-    
-    Returns:
-        X: Feature vectors (n_samples, 5)
-        y: Labels/Classes (n_samples,)
     """
-    # Feature order: [RSA, ECC, SHA1, AES, PQC]
-    
-    # Low Risk (Class 0): Using modern secure algorithms with PQC
-    low_risk_samples = [
-        [0, 1, 0, 1, 1],  # ECC + AES + PQC
-        [0, 1, 0, 1, 1],
-        [0, 1, 0, 1, 1],
-        [1, 0, 0, 1, 1],  # RSA (with PQC)
-        [1, 0, 0, 1, 1],
-        [0, 0, 0, 1, 1],  # AES + PQC only
-        [0, 0, 0, 1, 1],
-        [1, 1, 0, 1, 1],  # RSA + ECC + AES + PQC
-        [0, 1, 0, 0, 1],  # ECC + PQC (no deprecated SHA1, AES)
-        [1, 0, 0, 0, 1],  # RSA + PQC
+    Synthetic training data for quantum vulnerability classification.
+
+    Feature order: [RSA, ECC, MD5, SHA1, DiffieHellman, WeakTLS, AES, PQC]
+
+    Classes:
+        0 = Low Risk   — modern/PQC algorithms
+        1 = Medium Risk — RSA/ECC present but no stacking of broken algos
+        2 = High Risk   — multiple broken algorithms, no PQC
+    """
+
+    # ── LOW RISK (Class 0) — PQC in use, or only safe algorithms ─────────────
+    low = [
+        [0, 0, 0, 0, 0, 0, 1, 1],  # AES-256 + PQC
+        [0, 0, 0, 0, 0, 0, 1, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1],  # PQC only
+        [0, 0, 0, 0, 0, 0, 0, 1],
+        [1, 0, 0, 0, 0, 0, 1, 1],  # RSA + AES + PQC (migration in progress)
+        [0, 1, 0, 0, 0, 0, 1, 1],  # ECC + AES + PQC
+        [1, 1, 0, 0, 0, 0, 1, 1],  # RSA + ECC + AES + PQC
+        [0, 0, 0, 0, 0, 0, 1, 0],  # AES only (safe)
+        [0, 0, 0, 0, 0, 0, 1, 0],
+        [0, 1, 0, 0, 0, 0, 0, 1],  # ECC + PQC
+        [1, 0, 0, 0, 0, 0, 0, 1],  # RSA + PQC
+        [0, 0, 0, 0, 0, 0, 0, 0],  # No crypto at all
+        [1, 1, 0, 0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0, 0, 1, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1],
     ]
-    
-    # Medium Risk (Class 1): Using modern algorithms but missing PQC or with SHA1
-    medium_risk_samples = [
-        [1, 0, 1, 1, 0],  # RSA + SHA1 + AES (no PQC)
-        [0, 1, 1, 1, 0],  # ECC + SHA1 + AES (no PQC)
-        [1, 1, 1, 1, 0],  # RSA + ECC + SHA1 + AES (no PQC)
-        [1, 0, 0, 1, 0],  # RSA + AES (no PQC)
-        [0, 1, 0, 1, 0],  # ECC + AES (no PQC)
-        [1, 0, 1, 0, 0],  # RSA + SHA1 (no AES, no PQC)
-        [0, 1, 1, 0, 0],  # ECC + SHA1 (no AES, no PQC)
-        [1, 1, 0, 0, 0],  # RSA + ECC (no SHA1, AES, PQC)
-        [1, 0, 0, 0, 0],  # RSA only (no PQC)
-        [0, 1, 0, 0, 0],  # ECC only (no PQC)
-        [0, 0, 0, 1, 0],  # AES only (no PQC, RSA, ECC)
-        [0, 0, 1, 0, 0],  # SHA1 only
+
+    # ── MEDIUM RISK (Class 1) — RSA/ECC without PQC, or deprecated hashes ───
+    medium = [
+        [1, 0, 0, 0, 0, 0, 1, 0],  # RSA + AES (no PQC)
+        [0, 1, 0, 0, 0, 0, 1, 0],  # ECC + AES
+        [1, 1, 0, 0, 0, 0, 1, 0],  # RSA + ECC + AES
+        [1, 0, 0, 0, 0, 0, 0, 0],  # RSA only
+        [0, 1, 0, 0, 0, 0, 0, 0],  # ECC only
+        [1, 1, 0, 0, 0, 0, 0, 0],  # RSA + ECC
+        [0, 0, 0, 1, 0, 0, 1, 0],  # SHA1 + AES
+        [0, 0, 1, 0, 0, 0, 1, 0],  # MD5 + AES
+        [0, 0, 0, 1, 0, 1, 0, 0],  # SHA1 + WeakTLS
+        [0, 0, 1, 1, 0, 0, 0, 0],  # MD5 + SHA1
+        [1, 0, 0, 0, 0, 1, 0, 0],  # RSA + WeakTLS
+        [0, 0, 0, 0, 0, 1, 1, 0],  # WeakTLS + AES
+        [0, 0, 0, 0, 1, 0, 1, 0],  # DiffieHellman + AES
+        [1, 0, 0, 1, 0, 0, 1, 0],  # RSA + SHA1 + AES
+        [0, 1, 1, 0, 0, 0, 0, 0],  # ECC + MD5
+        [0, 0, 0, 0, 0, 1, 0, 0],  # WeakTLS only
+        [1, 0, 0, 0, 0, 0, 1, 0],
+        [0, 1, 0, 1, 0, 0, 1, 0],
+        [1, 0, 1, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0],  # DiffieHellman only
     ]
-    
-    # High Risk (Class 2): Using deprecated/weak algorithms without PQC
-    high_risk_samples = [
-        [1, 0, 1, 0, 0],  # RSA + SHA1 (no AES, no PQC)
-        [0, 0, 1, 0, 0],  # SHA1 only (weak, no PQC)
-        [1, 0, 1, 0, 0],  # RSA + SHA1
-        [1, 1, 1, 0, 0],  # RSA + ECC + SHA1 (all weak combo, no PQC)
-        [0, 0, 1, 1, 0],  # SHA1 + AES (SHA1 is deprecated)
-        [1, 0, 1, 1, 0],  # RSA with SHA1 hashing + AES
-        [0, 0, 1, 0, 0],
-        [1, 1, 0, 0, 0],  # RSA + ECC (no modern hashing/encryption, no PQC)
-        [1, 0, 1, 0, 0],
-        [0, 0, 1, 1, 0],
+
+    # ── HIGH RISK (Class 2) — stacked broken algorithms, no PQC ──────────────
+    high = [
+        [1, 0, 1, 1, 0, 1, 0, 0],  # RSA + MD5 + SHA1 + WeakTLS
+        [1, 1, 1, 1, 0, 0, 0, 0],  # RSA + ECC + MD5 + SHA1
+        [1, 0, 1, 0, 1, 0, 0, 0],  # RSA + MD5 + DH
+        [0, 1, 0, 1, 1, 1, 0, 0],  # ECC + SHA1 + DH + WeakTLS
+        [1, 1, 1, 1, 1, 1, 0, 0],  # Everything broken
+        [1, 0, 0, 1, 0, 1, 0, 0],  # RSA + SHA1 + WeakTLS
+        [0, 1, 1, 0, 1, 0, 0, 0],  # ECC + MD5 + DH
+        [1, 0, 1, 1, 1, 0, 0, 0],  # RSA + MD5 + SHA1 + DH
+        [0, 0, 1, 1, 0, 1, 0, 0],  # MD5 + SHA1 + WeakTLS
+        [1, 1, 0, 0, 1, 1, 0, 0],  # RSA + ECC + DH + WeakTLS
+        [1, 0, 1, 0, 0, 1, 0, 0],  # RSA + MD5 + WeakTLS
+        [0, 1, 1, 1, 0, 1, 0, 0],  # ECC + MD5 + SHA1 + WeakTLS
+        [1, 1, 1, 0, 1, 0, 0, 0],  # RSA + ECC + MD5 + DH
+        [1, 0, 0, 1, 1, 1, 0, 0],  # RSA + SHA1 + DH + WeakTLS
+        [0, 1, 1, 1, 1, 1, 0, 0],  # ECC + MD5 + SHA1 + DH + WeakTLS
+        [1, 1, 0, 1, 0, 1, 0, 0],  # RSA + ECC + SHA1 + WeakTLS
+        [1, 0, 1, 1, 0, 0, 0, 0],  # RSA + MD5 + SHA1
+        [0, 1, 0, 0, 1, 1, 0, 0],  # ECC + DH + WeakTLS
+        [1, 1, 1, 1, 0, 1, 0, 0],  # RSA + ECC + MD5 + SHA1 + WeakTLS
+        [1, 0, 0, 0, 1, 1, 0, 0],  # RSA + DH + WeakTLS
+        [0, 0, 1, 0, 1, 1, 0, 0],  # MD5 + DH + WeakTLS
+        [1, 1, 0, 0, 0, 1, 0, 0],  # RSA + ECC + WeakTLS
+        [0, 1, 1, 0, 0, 1, 0, 0],  # ECC + MD5 + WeakTLS
+        [1, 0, 1, 0, 1, 0, 0, 0],  # RSA + MD5 + DH
+        [0, 0, 1, 1, 1, 0, 0, 0],  # MD5 + SHA1 + DH
     ]
-    
-    X = np.array(low_risk_samples + medium_risk_samples + high_risk_samples)
-    y = np.array([0]*len(low_risk_samples) + 
-                 [1]*len(medium_risk_samples) + 
-                 [2]*len(high_risk_samples))
-    
+
+    X = np.array(low + medium + high)
+    y = np.array([0]*len(low) + [1]*len(medium) + [2]*len(high))
     return X, y
 
 
 def train_and_save_model(output_path='quantum_model.pkl'):
-    """Train the Random Forest Classifier and save it.
-    
-    Args:
-        output_path: Path where to save the trained model
-    """
-    print("Creating synthetic dataset...")
+    """Train Random Forest and save model + metadata."""
+    print("=" * 55)
+    print("  QuantumReady ML Model Training v2.0")
+    print("=" * 55)
+
     X, y = create_synthetic_dataset()
-    
-    print(f"Dataset shape: {X.shape}")
-    print(f"Class distribution: {np.bincount(y)}")
-    
-    # Split into training and test sets
+    counts = np.bincount(y)
+    print(f"\n📊 Dataset: {X.shape[0]} samples, {X.shape[1]} features")
+    print(f"   Features: {FEATURE_NAMES}")
+    print(f"   Classes : Low={counts[0]}, Medium={counts[1]}, High={counts[2]}")
+
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
-    
-    print("\nTraining Random Forest Classifier...")
+
     model = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=10,
-        min_samples_split=2,
-        random_state=42,
-        n_jobs=1
+        n_estimators=150, max_depth=8, min_samples_split=2,
+        min_samples_leaf=1, random_state=42, n_jobs=1
     )
-    
     model.fit(X_train, y_train)
-    
-    # Evaluate on test set
+
     train_score = model.score(X_train, y_train)
-    test_score = model.score(X_test, y_test)
-    
-    print(f"Training Accuracy: {train_score:.4f}")
-    print(f"Test Accuracy: {test_score:.4f}")
-    
-    # Predictions and detailed metrics
+    test_score  = model.score(X_test, y_test)
+    cv_scores   = cross_val_score(model, X, y, cv=5, scoring='accuracy')
+
+    print(f"\n📈 Accuracy:")
+    print(f"   Train      : {train_score:.4f}")
+    print(f"   Test       : {test_score:.4f}")
+    print(f"   CV (5-fold): {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+
     y_pred = model.predict(X_test)
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred, 
-                              target_names=['Low Risk', 'Medium Risk', 'High Risk']))
-    
-    print("\nConfusion Matrix:")
+    print("\n📋 Classification Report:")
+    print(classification_report(y_test, y_pred,
+                                target_names=['Low Risk', 'Medium Risk', 'High Risk']))
+    print("🗂  Confusion Matrix:")
     print(confusion_matrix(y_test, y_pred))
-    
-    # Feature importance
-    print("\nFeature Importance:")
-    feature_names = ['RSA', 'ECC', 'SHA1', 'AES', 'PQC']
-    for name, importance in zip(feature_names, model.feature_importances_):
-        print(f"  {name}: {importance:.4f}")
-    
-    # Save the model
-    joblib.dump(model, output_path)
-    print(f"\nModel saved to: {output_path}")
-    
+
+    print("\n🔍 Feature Importance:")
+    for name, imp in zip(FEATURE_NAMES, model.feature_importances_):
+        bar = "█" * int(imp * 40)
+        print(f"   {name:<18} {imp:.4f}  {bar}")
+
+    # Save model + metadata so app.py can validate feature count
+    model_data = {
+        'model': model,
+        'feature_names': FEATURE_NAMES,
+        'version': '2.0',
+        'n_features': len(FEATURE_NAMES),
+    }
+    joblib.dump(model_data, output_path)
+    print(f"\n✅ Saved to: {output_path}")
+    print("=" * 55)
     return model
 
 
 if __name__ == '__main__':
     train_and_save_model()
-
-
